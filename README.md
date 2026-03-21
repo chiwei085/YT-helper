@@ -37,6 +37,9 @@ Install `yt-helper` as a `uv`-managed CLI tool:
 uv tool install .
 ```
 
+By default, downloaded files and generated transcripts are saved under
+`~/Downloads/yt-helper`.
+
 ## Commands
 
 | Command | Purpose |

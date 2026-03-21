@@ -50,9 +50,11 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 
+DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "yt-helper"
+
 
 def _resolve_output_dir(output_dir: Path | None) -> Path:
-    return (output_dir or Path("downloads")).expanduser().resolve()
+    return (output_dir or DEFAULT_OUTPUT_DIR).expanduser().resolve()
 
 
 def _prompt_for_video_url(initial_value: str | None = None) -> str:
@@ -400,7 +402,7 @@ def download(
             resolve_path=False,
             help=(
                 "Directory where downloaded files will be saved. "
-                "Defaults to ./downloads"
+                "Defaults to ~/Downloads/yt-helper"
             ),
         ),
     ] = None,
@@ -471,7 +473,7 @@ def batch(
             resolve_path=False,
             help=(
                 "Directory where downloaded files will be saved. "
-                "Defaults to ./downloads"
+                "Defaults to ~/Downloads/yt-helper"
             ),
         ),
     ] = None,
@@ -578,7 +580,7 @@ def transcribe(
             resolve_path=False,
             help=(
                 "Directory where transcript text files will be saved. "
-                "Defaults to ./downloads"
+                "Defaults to ~/Downloads/yt-helper"
             ),
         ),
     ] = None,

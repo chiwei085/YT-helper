@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import patch
 
 from typer.testing import CliRunner
@@ -25,9 +26,9 @@ runner = CliRunner()
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_output_dir_defaults_to_downloads():
+def test_resolve_output_dir_defaults_to_user_downloads():
     result = _resolve_output_dir(None)
-    assert result.name == "downloads"
+    assert result == (Path.home() / "Downloads" / "yt-helper").resolve()
     assert result.is_absolute()
 
 
