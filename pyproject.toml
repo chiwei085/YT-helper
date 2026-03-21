@@ -1,0 +1,59 @@
+[project]
+name = "yt-helper"
+version = "0.1.0"
+description = "A CLI tools for download YT viedo with multiple functions"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.13.0",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+    "transformers>=5.3.0,<5.4.0",
+    "typer>=0.24.1",
+    "yt-dlp>=2026.3.17",
+]
+
+[project.scripts]
+yt-helper = "yt_helper.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yt_helper"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "B",
+    "I",
+    "N",
+    "UP",
+    "SIM",
+    "C4",
+    "RET",
+    "ARG",
+    "PIE",
+    "PERF",
+    "RUF",
+]
+ignore = ["RET504"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
