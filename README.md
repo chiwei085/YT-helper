@@ -1,21 +1,27 @@
 # yt-helper
 
-`yt-helper` is a command-line tool for downloading online media and turning video speech into timestamped plain-text transcripts.
+[![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9)](https://github.com/astral-sh/uv)
+[![yt-dlp](https://img.shields.io/badge/powered%20by-yt--dlp-111111)](https://github.com/yt-dlp/yt-dlp)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## Supported Features
+`yt-helper` is a command-line tool for downloading YouTube media and turning spoken content into timestamped plain-text transcripts.
 
-- Download the best available full video with audio, including playlist URLs.
-- Download visual-only video streams, including playlist URLs.
-- Download audio-only files for speech or audio workflows, including playlist URLs.
-- Choose common output containers for video downloads: `mp4`, `mkv`, `webm`.
-- Choose audio formats suited for downstream processing: `wav`, `flac`, `m4a`, `mp3`.
-- Resume interrupted downloads and retry unstable transfers through `yt-dlp`.
-- Show guided interactive prompts when a URL is not provided.
-- Inspect a video before downloading, including title, duration, uploader, subtitle availability, estimated size, and available formats.
-- Batch multiple URLs in one session, then start processing them together.
-- Skip duplicate URLs during batch input and keep only the first occurrence.
-- Prefer native subtitles when they exist, then fall back to Whisper ASR.
-- Save transcripts as timestamped plain text, for example:
+## Overview
+
+| Area | What it does |
+| --- | --- |
+| Download modes | Download full video, video-only streams, or audio-only files, including playlist URLs. |
+| Output formats | Export video as `mp4`, `mkv`, or `webm`, and audio as `wav`, `flac`, `m4a`, or `mp3`. |
+| Reliability | Resume interrupted downloads and retry unstable transfers through `yt-dlp`. |
+| Guided CLI | Prompt interactively for a URL when one is not provided. |
+| Media inspection | Show title, duration, uploader, subtitle availability, estimated size, and available formats before downloading. |
+| Batch workflow | Queue multiple URLs in one session and skip duplicates automatically. |
+| Transcription | Prefer native subtitles when available, then fall back to Whisper ASR. |
+| Acceleration | Use CUDA automatically for transcription when it is available. |
+
+## Transcript Output
+
+Transcripts are saved as timestamped plain text:
 
 ```text
 [0.0s] Welcome, today we're going to talk about...
@@ -23,11 +29,9 @@
 [45.1s] So the key insight here is that...
 ```
 
-- Prefer CUDA automatically when it is available for transcription.
-
 ## Installation
 
-Install `yt-helper` as a uv-managed CLI tool:
+Install `yt-helper` as a `uv`-managed CLI tool:
 
 ```bash
 uv tool install .
@@ -35,70 +39,21 @@ uv tool install .
 
 ## Commands
 
-Show all commands:
-
-```bash
-yt-helper --help
-```
-
-Download media:
-
-```bash
-yt-helper download --help
-```
-
-Inspect media information before downloading:
-
-```bash
-yt-helper info --help
-```
-
-Batch download:
-
-```bash
-yt-helper batch --help
-```
-
-Transcribe a video URL, preferring native subtitles first:
-
-```bash
-yt-helper transcribe --help
-```
+| Command | Purpose |
+| --- | --- |
+| `yt-helper --help` | Show the top-level CLI help. |
+| `yt-helper download --help` | Download media in full-video, video-only, or audio-only mode. |
+| `yt-helper info --help` | Inspect media information before downloading. |
+| `yt-helper batch --help` | Collect multiple URLs and process them in one batch. |
+| `yt-helper transcribe --help` | Generate a transcript, preferring native subtitles first. |
 
 ## Examples
 
-Download the best available full video:
-
-```bash
-yt-helper download "https://youtu.be/dQw4w9WgXcQ"
-```
-
-Inspect a video before deciding what to download:
-
-```bash
-yt-helper info "https://youtu.be/dQw4w9WgXcQ"
-```
-
-Download visual-only video as `mkv`:
-
-```bash
-yt-helper download --mode visual-only --video-format mkv "https://youtu.be/dQw4w9WgXcQ"
-```
-
-Download audio only as `wav`:
-
-```bash
-yt-helper download --mode audio --audio-format wav "https://youtu.be/dQw4w9WgXcQ"
-```
-
-Start interactive batch input:
-
-```bash
-yt-helper batch
-```
-
-Transcribe a video URL:
-
-```bash
-yt-helper transcribe "https://youtu.be/dQw4w9WgXcQ"
-```
+| Task | Command |
+| --- | --- |
+| Download the best available full video | `yt-helper download "https://youtu.be/dQw4w9WgXcQ"` |
+| Inspect a video before downloading | `yt-helper info "https://youtu.be/dQw4w9WgXcQ"` |
+| Download a video-only stream as `mkv` | `yt-helper download --mode visual-only --video-format mkv "https://youtu.be/dQw4w9WgXcQ"` |
+| Download audio only as `wav` | `yt-helper download --mode audio --audio-format wav "https://youtu.be/dQw4w9WgXcQ"` |
+| Start an interactive batch session | `yt-helper batch` |
+| Generate a transcript from a video URL | `yt-helper transcribe "https://youtu.be/dQw4w9WgXcQ"` |

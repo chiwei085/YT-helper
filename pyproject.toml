@@ -1,7 +1,7 @@
 [project]
 name = "yt-helper"
 version = "0.1.0"
-description = "A CLI tools for download YT viedo with multiple functions"
+description = "A command-line tool for downloading YouTube media and generating timestamped transcripts."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
