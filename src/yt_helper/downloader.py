@@ -64,6 +64,22 @@ class SubtitleDownloadResult:
     extension: str
 
 
+@dataclass(frozen=True)
+class PlaylistEntry:
+    """Represents one playable item in a playlist."""
+
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
+class PlaylistInfo:
+    """Represents a playlist and its playable entries."""
+
+    title: str
+    entries: tuple[PlaylistEntry, ...]
+
+
 def _format_bytes(value: int | float | None) -> str:
     if value is None:
         return "unknown size"
@@ -197,25 +213,41 @@ def _build_format_description(format_info: Mapping[str, Any]) -> str:
     return " | ".join(parts) if parts else "No additional format details"
 
 
-def fetch_media_info(url: str) -> MediaInfo:
-    """Fetch media metadata without downloading the file."""
-    options = {
+_COMPATIBILITY_OPTIONS: dict[str, Any] = {
+    "extractor_args": {"youtube": {"player_client": ["tv_simply"]}},
+    "js_runtimes": {"node": {}},
+    "remote_components": {"ejs:github"},
+}
+
+_use_compatibility_client = False
+
+
+def _probe_info(url: str, **overrides: Any) -> Mapping[str, Any]:
+    """Extract metadata for a URL without downloading it."""
+    options: dict[str, Any] = {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        **overrides,
     }
-
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
     except DownloadError as exc:
         raise VideoDownloadError(_build_download_error_message(exc)) from exc
 
-    if not isinstance(info, dict):
+    if not isinstance(info, Mapping):
         raise VideoDownloadError(
             "yt-dlp did not return usable media information for this URL."
         )
+
+    return info
+
+
+def fetch_media_info(url: str) -> MediaInfo:
+    """Fetch media metadata without downloading the file."""
+    info = _probe_info(url)
 
     formats: list[MediaFormatInfo] = []
     for fmt in info.get("formats", []):
@@ -247,6 +279,46 @@ def fetch_media_info(url: str) -> MediaInfo:
         ),
         estimated_size_bytes=_estimate_media_size(info),
         formats=tuple(formats),
+    )
+
+
+def fetch_playlist_info(url: str) -> PlaylistInfo:
+    """Fetch a playlist's playable entries without downloading media."""
+    info = _probe_info(
+        url,
+        noplaylist=False,
+        extract_flat=True,
+        ignoreerrors=True,
+    )
+    if info.get("_type") != "playlist":
+        raise VideoDownloadError(
+            "yt-dlp did not return usable playlist information for this URL."
+        )
+
+    entries: list[PlaylistEntry] = []
+    for entry in info.get("entries") or ():
+        if not isinstance(entry, Mapping):
+            continue
+
+        entry_url = entry.get("webpage_url") or entry.get("url")
+        if not isinstance(entry_url, str) or not entry_url.startswith(
+            ("http://", "https://")
+        ):
+            continue
+
+        entries.append(
+            PlaylistEntry(
+                title=str(entry.get("title") or "Video"),
+                url=entry_url,
+            )
+        )
+
+    if not entries:
+        raise VideoDownloadError("The playlist does not contain any playable videos.")
+
+    return PlaylistInfo(
+        title=str(info.get("title") or "Untitled playlist"),
+        entries=tuple(entries),
     )
 
 
@@ -485,37 +557,57 @@ def _download_media(
             "available disk space, and the selected path."
         ) from exc
 
-    progress_reporter = DownloadProgressReporter()
-    postprocessing_reporter = PostprocessingProgressReporter()
-    base_options = {
-        "noplaylist": not is_playlist,
-        "outtmpl": str(output_dir / "%(title)s [%(id)s].%(ext)s"),
-        "paths": {"home": str(output_dir)},
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "continuedl": True,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 5,
-        "file_access_retries": 3,
-        "socket_timeout": 30,
-        "concurrent_fragment_downloads": 4,
-        "progress_hooks": [progress_reporter],
-    }
-    merged_options = {**base_options, **options}
+    def attempt(extra_options: Mapping[str, Any]) -> Any:
+        progress_reporter = DownloadProgressReporter()
+        postprocessing_reporter = PostprocessingProgressReporter()
+        merged_options = {
+            "noplaylist": not is_playlist,
+            "outtmpl": str(output_dir / "%(title)s [%(id)s].%(ext)s"),
+            "paths": {"home": str(output_dir)},
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "continuedl": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "extractor_retries": 5,
+            "file_access_retries": 3,
+            "socket_timeout": 30,
+            "concurrent_fragment_downloads": 4,
+            "progress_hooks": [progress_reporter],
+            **options,
+            **extra_options,
+        }
+        try:
+            with ManagedYoutubeDL(
+                merged_options,
+                postprocessing_reporter=postprocessing_reporter,
+            ) as ydl:
+                return ydl.extract_info(url, download=True)
+        finally:
+            progress_reporter.finalize()
+            postprocessing_reporter.stop()
+
+    global _use_compatibility_client
 
     try:
-        with ManagedYoutubeDL(
-            merged_options,
-            postprocessing_reporter=postprocessing_reporter,
-        ) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info = attempt(_COMPATIBILITY_OPTIONS if _use_compatibility_client else {})
     except DownloadError as exc:
-        raise VideoDownloadError(_build_download_error_message(exc)) from exc
-    finally:
-        progress_reporter.finalize()
-        postprocessing_reporter.stop()
+        if _use_compatibility_client or "http error 403" not in str(exc).lower():
+            raise VideoDownloadError(_build_download_error_message(exc)) from exc
+
+        typer.secho(
+            "The default YouTube stream was rejected; retrying with a "
+            "compatibility client.",
+            fg=typer.colors.YELLOW,
+        )
+        _use_compatibility_client = True
+        try:
+            info = attempt(_COMPATIBILITY_OPTIONS)
+        except DownloadError as retry_exc:
+            raise VideoDownloadError(
+                _build_download_error_message(retry_exc)
+            ) from retry_exc
 
     if info is None:
         typer.secho(
@@ -588,22 +680,7 @@ def download_native_subtitles(
             "available disk space, and the selected path."
         ) from exc
 
-    probe_options = {
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
-    try:
-        with YoutubeDL(probe_options) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except DownloadError as exc:
-        raise VideoDownloadError(_build_download_error_message(exc)) from exc
-
-    if not isinstance(info, dict):
-        raise VideoDownloadError(
-            "yt-dlp did not return usable media information for this URL."
-        )
+    info = _probe_info(url)
 
     subtitles = info.get("subtitles")
     if not isinstance(subtitles, Mapping) or not subtitles:

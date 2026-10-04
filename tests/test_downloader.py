@@ -1,10 +1,21 @@
+from pathlib import Path
+from typing import ClassVar
+from unittest.mock import patch
+
+import pytest
 from yt_dlp.utils import DownloadError
 
+from yt_helper import downloader
 from yt_helper.downloader import (
+    AudioFormat,
     DownloadProgressReporter,
+    PlaylistInfo,
+    VideoDownloadError,
     _build_download_error_message,
     _format_bytes,
     _format_seconds,
+    download_audio,
+    fetch_playlist_info,
 )
 
 # ---------------------------------------------------------------------------
@@ -155,3 +166,152 @@ def test_extract_key_falls_back_to_literal_download():
 def test_extract_key_ignores_empty_filename():
     data = {"filename": "", "tmpfilename": "/tmp/video.part"}
     assert DownloadProgressReporter._extract_download_key(data) == "/tmp/video.part"
+
+
+FORBIDDEN_ERROR = "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+
+
+class _FakeManagedYoutubeDL:
+    """Record each attempt's options, failing the first `failures` attempts."""
+
+    attempts: ClassVar[list[dict]] = []
+    failures: ClassVar[int] = 0
+    error: ClassVar[str] = FORBIDDEN_ERROR
+
+    def __init__(self, options, **_kwargs):
+        type(self).attempts.append(options)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def extract_info(self, _url, **_kwargs):
+        if len(type(self).attempts) <= type(self).failures:
+            raise DownloadError(type(self).error)
+        return {"requested_downloads": [{"filepath": "/tmp/downloaded.wav"}]}
+
+
+def _fake_youtube_dl(
+    failures: int = 0,
+    error: str = FORBIDDEN_ERROR,
+) -> type[_FakeManagedYoutubeDL]:
+    return type(
+        "_Fake",
+        (_FakeManagedYoutubeDL,),
+        {"attempts": [], "failures": failures, "error": error},
+    )
+
+
+def test_download_media_retries_youtube_403_with_compatibility_client(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(downloader, "_use_compatibility_client", False)
+    fake = _fake_youtube_dl(failures=1)
+
+    with patch("yt_helper.downloader.ManagedYoutubeDL", fake):
+        result = download_audio(
+            "https://youtu.be/example",
+            tmp_path,
+            audio_format=AudioFormat.WAV,
+        )
+
+    assert result == Path("/tmp/downloaded.wav")
+    assert len(fake.attempts) == 2
+    assert "extractor_args" not in fake.attempts[0]
+    assert fake.attempts[0]["format"] == "bestaudio/best"
+    assert fake.attempts[1]["format"] == "bestaudio/best"
+    assert fake.attempts[1]["extractor_args"] == {
+        "youtube": {"player_client": ["tv_simply"]}
+    }
+    assert fake.attempts[1]["js_runtimes"] == {"node": {}}
+    assert fake.attempts[1]["remote_components"] == {"ejs:github"}
+
+
+def test_download_media_reuses_compatibility_client_after_first_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(downloader, "_use_compatibility_client", True)
+    fake = _fake_youtube_dl()
+
+    with patch("yt_helper.downloader.ManagedYoutubeDL", fake):
+        download_audio("https://youtu.be/example", tmp_path)
+
+    assert len(fake.attempts) == 1
+    assert fake.attempts[0]["extractor_args"] == {
+        "youtube": {"player_client": ["tv_simply"]}
+    }
+
+
+def test_download_media_reports_non_403_failures_without_retrying(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(downloader, "_use_compatibility_client", False)
+    fake = _fake_youtube_dl(
+        failures=1,
+        error="ERROR: requested format is not available",
+    )
+
+    with (
+        patch("yt_helper.downloader.ManagedYoutubeDL", fake),
+        pytest.raises(VideoDownloadError, match="rejected the requested media"),
+    ):
+        download_audio("https://youtu.be/example", tmp_path)
+
+    assert len(fake.attempts) == 1
+    assert downloader._use_compatibility_client is False
+
+
+# ---------------------------------------------------------------------------
+# Playlist metadata
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_playlist_info_returns_playable_entries():
+    playlist_data = {
+        "_type": "playlist",
+        "title": "Mixed language lessons",
+        "entries": [
+            {
+                "title": "First lesson",
+                "url": "https://www.youtube.com/watch?v=video-one",
+            },
+            None,
+            {
+                "title": "Second lesson",
+                "url": "https://www.youtube.com/watch?v=video-two",
+            },
+        ],
+    }
+    with patch("yt_helper.downloader.YoutubeDL") as youtube_dl:
+        youtube_dl.return_value.__enter__.return_value.extract_info.return_value = (
+            playlist_data
+        )
+        result = fetch_playlist_info("https://youtube.test/playlist")
+
+    assert isinstance(result, PlaylistInfo)
+    assert result.title == "Mixed language lessons"
+    assert [(entry.title, entry.url) for entry in result.entries] == [
+        ("First lesson", "https://www.youtube.com/watch?v=video-one"),
+        ("Second lesson", "https://www.youtube.com/watch?v=video-two"),
+    ]
+
+
+def test_fetch_playlist_info_rejects_empty_playlist():
+    with patch("yt_helper.downloader.YoutubeDL") as youtube_dl:
+        youtube_dl.return_value.__enter__.return_value.extract_info.return_value = {
+            "_type": "playlist",
+            "title": "Empty",
+            "entries": [],
+        }
+
+        try:
+            fetch_playlist_info("https://youtube.test/playlist")
+        except VideoDownloadError as exc:
+            assert "does not contain any playable videos" in str(exc)
+        else:
+            raise AssertionError("Expected an empty playlist to fail")

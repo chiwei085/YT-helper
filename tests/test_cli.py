@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from typer.testing import CliRunner
 
@@ -13,10 +13,12 @@ from yt_helper.cli import (
 from yt_helper.downloader import (
     MediaFormatInfo,
     MediaInfo,
+    PlaylistEntry,
+    PlaylistInfo,
     VideoDownloadError,
     VideoFormat,
 )
-from yt_helper.transcription import TranscriptionResult
+from yt_helper.transcription import TranscriptionError, TranscriptionResult
 
 runner = CliRunner()
 
@@ -43,9 +45,7 @@ def test_resolve_output_dir_uses_provided_path(tmp_path):
 
 
 def test_analyze_youtube_playlist_url():
-    target = _analyze_url_target(
-        "https://www.youtube.com/playlist?list=PL1234567890"
-    )
+    target = _analyze_url_target("https://www.youtube.com/playlist?list=PL1234567890")
     assert target.canonical_url == "https://www.youtube.com/playlist?list=PL1234567890"
     assert target.dedupe_key == "youtube-playlist:PL1234567890"
     assert target.is_playlist is True
@@ -86,9 +86,7 @@ def test_normalize_youtube_watch_with_playlist_prefers_playlist():
 
 
 def test_normalize_youtube_watch_strips_non_playlist_params():
-    url, key = _normalize_batch_url(
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=30"
-    )
+    url, key = _normalize_batch_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=30")
     assert url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert key == "youtube:dQw4w9WgXcQ"
 
@@ -327,8 +325,9 @@ def test_transcribe_success(tmp_path):
     transcript_path = tmp_path / "audio.txt"
     fake_result = TranscriptionResult(
         output_path=transcript_path,
-        source="whisper",
+        source="qwen",
         device_label="CPU",
+        language="Chinese,English",
     )
 
     with (
@@ -348,7 +347,8 @@ def test_transcribe_success(tmp_path):
 
     assert result.exit_code == 0
     assert "Transcription complete." in result.output
-    assert "Source: whisper" in result.output
+    assert "Source: qwen" in result.output
+    assert "Detected language(s): Chinese,English" in result.output
     assert "CPU" in result.output
 
 
@@ -388,12 +388,15 @@ def test_transcribe_prefers_native_subtitles(tmp_path):
 
 
 def test_transcribe_download_fails(tmp_path):
-    with patch(
-        "yt_helper.cli.download_native_subtitles",
-        return_value=None,
-    ), patch(
-        "yt_helper.cli.download_audio",
-        side_effect=VideoDownloadError("Download error"),
+    with (
+        patch(
+            "yt_helper.cli.download_native_subtitles",
+            return_value=None,
+        ),
+        patch(
+            "yt_helper.cli.download_audio",
+            side_effect=VideoDownloadError("Download error"),
+        ),
     ):
         result = runner.invoke(
             app,
@@ -402,6 +405,75 @@ def test_transcribe_download_fails(tmp_path):
 
     assert result.exit_code == 1
     assert "Download failed." in result.output
+
+
+def test_transcribe_playlist_processes_each_video_and_continues_on_error(tmp_path):
+    playlist = PlaylistInfo(
+        title="L2 (Crypto)",
+        entries=(
+            PlaylistEntry(
+                title="Encryption definition",
+                url="https://www.youtube.com/watch?v=first",
+            ),
+            PlaylistEntry(
+                title="Notion part1",
+                url="https://www.youtube.com/watch?v=second",
+            ),
+        ),
+    )
+    transcript_path = tmp_path / "first.txt"
+    first_result = TranscriptionResult(
+        output_path=transcript_path,
+        source="qwen",
+        device_label="CPU",
+        language="English",
+    )
+
+    with (
+        patch("yt_helper.cli.fetch_playlist_info", return_value=playlist),
+        patch(
+            "yt_helper.cli._transcribe_url",
+            side_effect=[first_result, TranscriptionError("ASR failed")],
+        ) as transcribe_url,
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "https://www.youtube.com/playlist?list=PL123",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Detected target type: playlist" in result.output
+    assert "Playlist: L2 (Crypto)" in result.output
+    assert "[1/2] Encryption definition" in result.output
+    assert "[2/2] Notion part1" in result.output
+    assert "Successful: 1" in result.output
+    assert "Failed: 1" in result.output
+    assert transcribe_url.call_args_list == [
+        call("https://www.youtube.com/watch?v=first", tmp_path.resolve()),
+        call("https://www.youtube.com/watch?v=second", tmp_path.resolve()),
+    ]
+
+
+def test_transcribe_playlist_rejects_single_output_path(tmp_path):
+    with patch("yt_helper.cli.fetch_playlist_info") as fetch_playlist:
+        result = runner.invoke(
+            app,
+            [
+                "transcribe",
+                "--output",
+                str(tmp_path / "all.txt"),
+                "https://www.youtube.com/playlist?list=PL123",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "--output cannot be used with a playlist" in result.output
+    fetch_playlist.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

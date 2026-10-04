@@ -11,6 +11,7 @@ import typer
 from yt_helper.downloader import (
     AudioFormat,
     MediaInfo,
+    PlaylistInfo,
     VideoDownloadError,
     VideoFormat,
     download_audio,
@@ -18,6 +19,7 @@ from yt_helper.downloader import (
     download_video,
     download_video_only,
     fetch_media_info,
+    fetch_playlist_info,
 )
 from yt_helper.transcription import (
     TranscriptionError,
@@ -558,14 +560,93 @@ def batch(
     typer.echo(f"Failed: {failure_count}")
 
 
+def _transcribe_url(
+    url: str,
+    output_dir: Path,
+    output_path: Path | None = None,
+) -> TranscriptionResult:
+    """Transcribe one URL; `output_path`, when given, must already be resolved."""
+    native_subtitles = download_native_subtitles(url, output_dir)
+    if native_subtitles is not None:
+        subtitle_path = native_subtitles.output_path
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                subtitle_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            subtitle_path = output_path
+        return TranscriptionResult(
+            output_path=subtitle_path,
+            source="native subtitles",
+            language=native_subtitles.language,
+        )
+
+    with TemporaryDirectory(prefix="yt-helper-transcribe-") as temp_dir:
+        downloaded_audio = download_audio(
+            url,
+            Path(temp_dir),
+            audio_format=AudioFormat.WAV,
+        )
+        if downloaded_audio is None:
+            raise TranscriptionError(
+                "Audio download completed, but no audio file path was returned."
+            )
+
+        return transcribe_media(
+            downloaded_audio,
+            output_path=output_path or output_dir / f"{downloaded_audio.stem}.txt",
+        )
+
+
+def _render_transcription_details(result: TranscriptionResult) -> None:
+    typer.echo(f"Source: {result.source}")
+    if result.language is not None:
+        typer.echo(f"Detected language(s): {result.language}")
+    if result.device_label is not None:
+        typer.echo(f"Accelerator: {result.device_label}")
+    typer.echo(f"Saved to: {result.output_path}")
+
+
+def _transcribe_playlist(playlist: PlaylistInfo, output_dir: Path) -> bool:
+    typer.echo(f"Playlist: {playlist.title}")
+    typer.echo(f"Videos: {len(playlist.entries)}")
+    typer.echo()
+
+    success_count = 0
+    for position, entry in enumerate(playlist.entries, start=1):
+        typer.secho(
+            f"[{position}/{len(playlist.entries)}] {entry.title}",
+            fg=typer.colors.CYAN,
+            bold=True,
+        )
+        try:
+            result = _transcribe_url(entry.url, output_dir)
+        except (VideoDownloadError, TranscriptionError) as exc:
+            typer.secho("Failed.", fg=typer.colors.RED, bold=True)
+            typer.echo(str(exc))
+            typer.echo()
+            continue
+
+        success_count += 1
+        typer.secho("Completed.", fg=typer.colors.GREEN, bold=True)
+        _render_transcription_details(result)
+        typer.echo()
+
+    typer.secho("Playlist transcription finished.", fg=typer.colors.GREEN, bold=True)
+    typer.echo(f"Successful: {success_count}")
+    typer.echo(f"Failed: {len(playlist.entries) - success_count}")
+    return success_count > 0
+
+
 @app.command()
 def transcribe(
     url: Annotated[
         str | None,
         typer.Argument(
             help=(
-                "Video URL to transcribe. If omitted, the CLI will ask for it "
-                "interactively."
+                "Video or playlist URL to transcribe. If omitted, the CLI will "
+                "ask for it interactively."
             ),
         ),
     ] = None,
@@ -595,64 +676,53 @@ def transcribe(
             resolve_path=False,
             help=(
                 "Text file path for the transcript. Defaults to a .txt file "
-                "named after the downloaded audio."
+                "named after the downloaded audio. Not available for playlists."
             ),
         ),
     ] = None,
 ) -> None:
-    """Prefer native subtitles, then fall back to Whisper transcription."""
+    """Transcribe one video or every video in a playlist."""
     resolved_url = _prompt_for_video_url(url)
+    target = _analyze_url_target(resolved_url)
     resolved_output_dir = _resolve_output_dir(output_dir)
+
+    if target.is_playlist and output_path is not None:
+        raise typer.BadParameter(
+            "--output cannot be used with a playlist because each video "
+            "creates a separate transcript. Use --output-dir instead."
+        )
+
+    resolved_output_path = (
+        output_path.expanduser().resolve() if output_path is not None else None
+    )
 
     typer.echo()
     typer.secho("yt-helper", fg=typer.colors.CYAN, bold=True)
-    typer.echo("Trying native subtitles first, then falling back to Whisper.")
-    typer.echo(f"Source URL: {resolved_url}")
+    typer.echo("Trying native subtitles first, then falling back to Qwen ASR.")
+    typer.echo(f"Source URL: {target.canonical_url}")
+    if target.is_playlist:
+        typer.echo("Detected target type: playlist")
     typer.echo(f"Transcript directory: {resolved_output_dir}")
-    if output_path is not None:
-        typer.echo(f"Output file: {output_path.expanduser().resolve()}")
+    if resolved_output_path is not None:
+        typer.echo(f"Output file: {resolved_output_path}")
     typer.echo()
 
-    try:
-        native_subtitles = download_native_subtitles(
-            resolved_url,
-            resolved_output_dir,
-        )
-        if native_subtitles is not None:
-            result = TranscriptionResult(
-                output_path=(
-                    output_path.expanduser().resolve()
-                    if output_path is not None
-                    else native_subtitles.output_path
-                ),
-                source="native subtitles",
-            )
-            if output_path is not None:
-                result.output_path.write_text(
-                    native_subtitles.output_path.read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
-        else:
-            with TemporaryDirectory(prefix="yt-helper-transcribe-") as temp_dir:
-                temp_audio_dir = Path(temp_dir)
-                downloaded_audio = download_audio(
-                    resolved_url,
-                    temp_audio_dir,
-                    audio_format=AudioFormat.WAV,
-                )
-                if downloaded_audio is None:
-                    raise TranscriptionError(
-                        "Audio download completed, but no audio file path was returned."
-                    )
+    if target.is_playlist:
+        try:
+            playlist = fetch_playlist_info(target.canonical_url)
+        except VideoDownloadError as exc:
+            _handle_download_error(exc)
 
-                resolved_output_path = (
-                    output_path.expanduser().resolve()
-                    if output_path is not None
-                    else resolved_output_dir / f"{downloaded_audio.stem}.txt"
-                )
-                result = transcribe_media(
-                    downloaded_audio, output_path=resolved_output_path
-                )
+        if not _transcribe_playlist(playlist, resolved_output_dir):
+            raise typer.Exit(code=1)
+        return
+
+    try:
+        result = _transcribe_url(
+            target.canonical_url,
+            resolved_output_dir,
+            resolved_output_path,
+        )
     except VideoDownloadError as exc:
         _handle_download_error(exc)
     except TranscriptionError as exc:
@@ -660,10 +730,7 @@ def transcribe(
 
     typer.echo()
     typer.secho("Transcription complete.", fg=typer.colors.GREEN, bold=True)
-    typer.echo(f"Source: {result.source}")
-    if result.device_label is not None:
-        typer.echo(f"Accelerator: {result.device_label}")
-    typer.echo(f"Saved to: {result.output_path}")
+    _render_transcription_details(result)
 
 
 def main() -> None:

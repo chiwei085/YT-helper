@@ -1,37 +1,14 @@
 import gc
-import logging
-import wave
-from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import torch
-from transformers import pipeline
-
-DEFAULT_ASR_MODEL = "openai/whisper-large-v3"
+DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+DEFAULT_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 DEFAULT_SEGMENT_MAX_CHARS = 36
-SEGMENT_BREAK_PUNCTUATION = (
-    "\u3002",
-    "\uff01",
-    "\uff1f",
-    "\uff1b",
-    "\uff1a",
-    ",",
-    ".",
-    "!",
-    "?",
-    ";",
-)
-
-_ASR_PIPELINE: Any | None = None
-_ASR_DEVICE_LABEL: str | None = None
-_SUPPRESSED_TRANSFORMERS_WARNINGS = (
-    "A custom logits processor of type <class "
-    "'transformers.generation.logits_process.SuppressTokensLogitsProcessor'>",
-    "A custom logits processor of type <class "
-    "'transformers.generation.logits_process.SuppressTokensAtBeginLogitsProcessor'>",
+SEGMENT_BREAK_PUNCTUATION = frozenset(
+    "\u3002\uff0c\u3001\uff01\uff1f\uff1b\uff1a,.!?;"
 )
 
 
@@ -46,58 +23,42 @@ class TranscriptionResult:
     output_path: Path
     source: str
     device_label: str | None = None
+    language: str | None = None
 
 
-class _KnownTransformersWarningFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        return not any(
-            warning in message for warning in _SUPPRESSED_TRANSFORMERS_WARNINGS
-        )
+def _resolve_device() -> tuple[str, Any, str]:
+    import torch
 
-
-@contextmanager
-def _suppress_known_transformers_warnings() -> Any:
-    logger = logging.getLogger("transformers.generation.utils")
-    warning_filter = _KnownTransformersWarningFilter()
-    logger.addFilter(warning_filter)
-    try:
-        yield
-    finally:
-        logger.removeFilter(warning_filter)
-
-
-def _resolve_device() -> tuple[int, torch.dtype, str]:
     if torch.cuda.is_available():
-        return 0, torch.float16, "CUDA"
-    return -1, torch.float32, "CPU"
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return "cuda:0", dtype, "CUDA"
+    return "cpu", torch.float32, "CPU"
 
 
-def _clear_asr_pipeline() -> None:
-    global _ASR_PIPELINE, _ASR_DEVICE_LABEL
+def _clear_asr_model() -> None:
+    import torch
 
-    _ASR_PIPELINE = None
-    _ASR_DEVICE_LABEL = None
+    _get_asr_model.cache_clear()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
-def _get_asr_pipeline() -> tuple[Any, str]:
-    global _ASR_PIPELINE, _ASR_DEVICE_LABEL
+@cache
+def _get_asr_model() -> tuple[Any, str]:
+    from qwen_asr import Qwen3ASRModel
 
-    if _ASR_PIPELINE is not None and _ASR_DEVICE_LABEL is not None:
-        return _ASR_PIPELINE, _ASR_DEVICE_LABEL
-
-    device, torch_dtype, device_label = _resolve_device()
-    _ASR_PIPELINE = pipeline(
-        "automatic-speech-recognition",
-        model=DEFAULT_ASR_MODEL,
-        device=device,
+    device_map, torch_dtype, device_label = _resolve_device()
+    model = Qwen3ASRModel.from_pretrained(
+        DEFAULT_ASR_MODEL,
         dtype=torch_dtype,
+        device_map=device_map,
+        forced_aligner=DEFAULT_FORCED_ALIGNER_MODEL,
+        forced_aligner_kwargs={"dtype": torch_dtype, "device_map": device_map},
+        max_inference_batch_size=1,
+        max_new_tokens=2048,
     )
-    _ASR_DEVICE_LABEL = device_label
-    return _ASR_PIPELINE, _ASR_DEVICE_LABEL
+    return model, device_label
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -112,140 +73,103 @@ def _format_exception_message(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-def _format_transcript(result: dict[str, Any]) -> str:
-    chunks = result.get("chunks")
-    if not chunks:
-        text = str(result.get("text", "")).strip()
-        if not text:
-            raise TranscriptionError("The model did not return any transcription text.")
+def _format_transcript(result: Any) -> str:
+    text = " ".join(str(getattr(result, "text", "")).split())
+    if not text:
+        raise TranscriptionError("The model did not return any transcription text.")
+
+    aligned_positions = _locate_aligned_tokens(
+        text,
+        getattr(result, "time_stamps", None) or (),
+    )
+    if not aligned_positions:
         return f"[0.0s] {text}"
 
-    return _format_segmented_transcript(chunks)
-
-
-def _format_segmented_transcript(chunks: list[dict[str, Any]]) -> str:
+    parts = _split_text_with_offsets(text)
     lines: list[str] = []
-    for chunk in chunks:
-        text = str(chunk.get("text", "")).strip()
-        if not text:
-            continue
+    previous_start = aligned_positions[0][1]
+    token_index = 0
+    for part_start, part_end, part_text in parts:
+        while (
+            token_index < len(aligned_positions)
+            and aligned_positions[token_index][0] < part_start
+        ):
+            previous_start = aligned_positions[token_index][1]
+            token_index += 1
 
-        timestamp = chunk.get("timestamp")
-        if timestamp is None:
-            timestamp = (0.0, None)
-        if not isinstance(timestamp, tuple) or not timestamp:
-            raise TranscriptionError(
-                "The ASR pipeline returned an unexpected timestamp format."
-            )
+        if (
+            token_index < len(aligned_positions)
+            and aligned_positions[token_index][0] < part_end
+        ):
+            previous_start = aligned_positions[token_index][1]
 
-        start = float(timestamp[0])
-        end = (
-            float(timestamp[1])
-            if len(timestamp) > 1 and timestamp[1] is not None
-            else None
-        )
-        for segment_start, segment_text in _split_segment_text(start, end, text):
-            lines.append(f"[{_format_timestamp(segment_start)}] {segment_text}")
-
-    if not lines:
-        raise TranscriptionError(
-            "The model returned chunks, but all chunk text was empty."
-        )
+        lines.append(f"[{_format_timestamp(previous_start)}] {part_text}")
 
     return "\n".join(lines)
 
 
-def _split_segment_text(
-    start: float,
-    end: float | None,
+def _split_text_with_offsets(text: str) -> list[tuple[int, int, str]]:
+    parts: list[tuple[int, int, str]] = []
+    part_start = 0
+
+    def flush(raw_start: int, raw_part: str) -> None:
+        clean_part = raw_part.strip()
+        if not clean_part:
+            return
+        clean_start = raw_start + len(raw_part) - len(raw_part.lstrip())
+        parts.append((clean_start, clean_start + len(clean_part), clean_part))
+
+    for index, char in enumerate(text):
+        if (
+            char not in SEGMENT_BREAK_PUNCTUATION
+            and index - part_start + 1 < DEFAULT_SEGMENT_MAX_CHARS
+        ):
+            continue
+
+        flush(part_start, text[part_start : index + 1])
+        part_start = index + 1
+
+    flush(part_start, text[part_start:])
+    return parts
+
+
+def _locate_aligned_tokens(
     text: str,
-) -> list[tuple[float, str]]:
-    clean_text = " ".join(text.split())
-    if len(clean_text) <= DEFAULT_SEGMENT_MAX_CHARS:
-        return [(start, clean_text)]
+    time_stamps: Any,
+) -> list[tuple[int, float]]:
+    positions: list[tuple[int, float]] = []
+    search_text = text.casefold()
+    search_start = 0
+    for item in time_stamps:
+        token = str(getattr(item, "text", "")).strip()
+        if not token:
+            continue
 
-    parts: list[str] = []
-    current = ""
-    for char in clean_text:
-        current += char
-        should_split = (
-            char in SEGMENT_BREAK_PUNCTUATION
-            or len(current) >= DEFAULT_SEGMENT_MAX_CHARS
-        )
-        if should_split:
-            part = current.strip()
-            if part:
-                parts.append(part)
-            current = ""
+        position = search_text.find(token.casefold(), search_start)
+        if position < 0:
+            continue
 
-    if current.strip():
-        parts.append(current.strip())
+        try:
+            start_time = float(item.start_time)
+        except (TypeError, ValueError):
+            continue
 
-    if len(parts) <= 1 or end is None or end <= start:
-        return [(start, clean_text)]
+        positions.append((position, start_time))
+        search_start = position + len(token)
 
-    total_chars = sum(len(part) for part in parts)
-    duration = end - start
-    split_segments: list[tuple[float, str]] = []
-    elapsed = 0.0
-    for part in parts:
-        split_start = start + elapsed
-        split_segments.append((split_start, part))
-        elapsed += duration * (len(part) / total_chars)
-
-    return split_segments
+    return positions
 
 
-def _detect_language(pipe: Any, input_path: Path) -> str | None:
-    """Detect spoken language from the first 30 seconds of audio."""
-    try:
-        with wave.open(str(input_path), "rb") as wf:
-            framerate = wf.getframerate()
-            nchannels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
-            n_frames = min(int(framerate * 30), wf.getnframes())
-            raw = wf.readframes(n_frames)
-
-        dtype_map = {1: np.int8, 2: np.int16, 4: np.int32}
-        dtype = dtype_map.get(sampwidth, np.int16)
-        audio = np.frombuffer(raw, dtype=dtype).astype(np.float32)
-        audio /= np.iinfo(dtype).max
-        if nchannels > 1:
-            audio = audio.reshape(-1, nchannels).mean(axis=1)
-
-        inputs = pipe.feature_extractor(
-            audio, sampling_rate=framerate, return_tensors="pt"
-        )
-        input_features = inputs.input_features.to(pipe.device)
-        with torch.no_grad():
-            language_token_ids = pipe.model.detect_language(input_features)
-
-        decoded = pipe.tokenizer.batch_decode(
-            language_token_ids, skip_special_tokens=False
-        )
-        return decoded[0].strip("<>|")
-    except Exception:
-        return None
-
-
-def _transcribe_with_pipeline(pipe: Any, input_path: Path) -> dict[str, Any]:
-    language = _detect_language(pipe, input_path)
-    generate_kwargs: dict[str, Any] = {"task": "transcribe"}
-    if language is not None:
-        generate_kwargs["language"] = language
-
-    result = pipe(
-        str(input_path),
-        return_timestamps=True,
-        chunk_length_s=30,
-        stride_length_s=[5, 0],
-        batch_size=8,
-        generate_kwargs=generate_kwargs,
+def _transcribe_with_model(model: Any, input_path: Path) -> Any:
+    results = model.transcribe(
+        audio=str(input_path),
+        language=None,
+        return_time_stamps=True,
     )
-    if not isinstance(result, dict):
-        raise TranscriptionError("The ASR pipeline returned an unexpected result.")
+    if not isinstance(results, list) or len(results) != 1:
+        raise TranscriptionError("The Qwen ASR model returned an unexpected result.")
 
-    return result
+    return results[0]
 
 
 def transcribe_media(
@@ -267,11 +191,14 @@ def transcribe_media(
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        pipe, device_label = _get_asr_pipeline()
-        with _suppress_known_transformers_warnings():
-            result = _transcribe_with_pipeline(pipe, resolved_input_path)
+        model, device_label = _get_asr_model()
     except Exception as exc:
-        _clear_asr_pipeline()
+        _clear_asr_model()
+        raise TranscriptionError(_format_exception_message(exc)) from exc
+
+    try:
+        result = _transcribe_with_model(model, resolved_input_path)
+    except Exception as exc:
         raise TranscriptionError(_format_exception_message(exc)) from exc
 
     transcript = _format_transcript(result)
@@ -279,6 +206,7 @@ def transcribe_media(
 
     return TranscriptionResult(
         output_path=resolved_output_path,
-        source="whisper",
+        source="qwen",
         device_label=device_label,
+        language=str(getattr(result, "language", "")).strip() or None,
     )

@@ -5,10 +5,9 @@ description = "A command-line tool for downloading YouTube media and generating 
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "accelerate>=1.13.0",
+    "qwen-asr>=0.0.6",
     "torch>=2.10.0",
     "tqdm>=4.67.3",
-    "transformers>=5.3.0,<5.4.0",
     "typer>=0.24.1",
     "yt-dlp>=2026.3.17",
 ]

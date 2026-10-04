@@ -16,8 +16,14 @@
 | Guided CLI | Prompt interactively for a URL when one is not provided. |
 | Media inspection | Show title, duration, uploader, subtitle availability, estimated size, and available formats before downloading. |
 | Batch workflow | Queue multiple URLs in one session and skip duplicates automatically. |
-| Transcription | Prefer native subtitles when available, then fall back to Whisper ASR. |
+| Transcription | Transcribe individual videos or complete playlists, preferring native subtitles before Qwen3-ASR with automatic mixed-language detection. |
 | Acceleration | Use CUDA automatically for transcription when it is available. |
+
+The Qwen backend leaves language selection on automatic detection instead of
+forcing one language for the whole recording. This preserves Chinese/English
+code-switching, while Qwen's forced aligner supplies timestamps for both
+languages. The first ASR run downloads the Qwen3-ASR 1.7B model and the Qwen3
+Forced Aligner 0.6B model automatically.
 
 ## Transcript Output
 
@@ -60,3 +66,9 @@ By default, downloaded files and generated transcripts are saved under
 | Download audio only as `wav` | `yt-helper download --mode audio --audio-format wav "https://youtu.be/dQw4w9WgXcQ"` |
 | Start an interactive batch session | `yt-helper batch` |
 | Generate a transcript from a video URL | `yt-helper transcribe "https://youtu.be/dQw4w9WgXcQ"` |
+| Transcribe every video in a playlist | `yt-helper transcribe "https://www.youtube.com/playlist?list=PLY5cA9i1xtLVpb9Lbbo5toMnfsWR2OT9Y"` |
+
+Playlist transcription writes one file per video to `--output-dir`. Processing
+continues if an individual video fails and reports successful and failed counts
+at the end. Since a playlist produces multiple files, `--output` is available
+only for single-video transcription.
