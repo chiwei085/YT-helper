@@ -59,9 +59,23 @@ def _resolve_output_dir(output_dir: Path | None) -> Path:
     return (output_dir or DEFAULT_OUTPUT_DIR).expanduser().resolve()
 
 
+def _clean_url(url: str) -> str:
+    """Normalize a pasted URL: shell escapes, wrapping punctuation, bare hostnames."""
+    # Shells escape "?" and "=" on paste; browsers and chat apps add wrappers.
+    cleaned = url.strip().strip("<>\"'").replace("\\", "")
+    # Drops stray whitespace and zero-width characters from rich-text copies.
+    cleaned = "".join(
+        char for char in cleaned if char.isprintable() and not char.isspace()
+    )
+    if cleaned and "://" not in cleaned:
+        cleaned = f"https://{cleaned}"
+
+    return cleaned
+
+
 def _prompt_for_video_url(initial_value: str | None = None) -> str:
-    if initial_value and initial_value.strip():
-        return initial_value.strip()
+    if initial_value and _clean_url(initial_value):
+        return _clean_url(initial_value)
 
     typer.echo()
     typer.secho("No video URL was provided.", fg=typer.colors.YELLOW, bold=True)
@@ -70,7 +84,7 @@ def _prompt_for_video_url(initial_value: str | None = None) -> str:
     typer.echo()
 
     while True:
-        url = typer.prompt("Video URL", prompt_suffix=": ").strip()
+        url = _clean_url(typer.prompt("Video URL", prompt_suffix=": "))
         if url.startswith(("http://", "https://")):
             return url
 
@@ -81,7 +95,7 @@ def _prompt_for_video_url(initial_value: str | None = None) -> str:
 
 
 def _analyze_url_target(url: str) -> UrlTarget:
-    parsed = urlparse(url.strip())
+    parsed = urlparse(_clean_url(url))
     hostname = (parsed.hostname or "").lower()
     query = parse_qs(parsed.query)
 

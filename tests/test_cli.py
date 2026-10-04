@@ -1,10 +1,12 @@
 from pathlib import Path
 from unittest.mock import call, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from yt_helper.cli import (
     _analyze_url_target,
+    _clean_url,
     _normalize_batch_url,
     _queue_batch_url,
     _resolve_output_dir,
@@ -499,3 +501,28 @@ def test_batch_playlist_url_uses_playlist_mode(tmp_path):
         is_playlist=True,
         video_format=VideoFormat.MP4,
     )
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "https://www.youtube.com/playlist\\?list\\=PL1234567890",
+        "  https://www.youtube.com/playlist?list=PL1234567890\n",
+        "<https://www.youtube.com/playlist?list=PL1234567890>",
+        "'https://www.youtube.com/playlist?list=PL1234567890'",
+        "www.youtube.com/playlist?list=PL1234567890",
+        "https://www.youtube.com/playlist?list=PL1234567890\u200b",
+        "https://www.youtube.com/watch?v=abc&list=PL1234567890&si=tracking",
+    ],
+)
+def test_analyze_url_target_normalizes_pasted_urls(pasted):
+    target = _analyze_url_target(pasted)
+    assert target.is_playlist
+    assert target.canonical_url == (
+        "https://www.youtube.com/playlist?list=PL1234567890"
+    )
+
+
+def test_clean_url_leaves_a_clean_url_alone():
+    url = "https://youtu.be/dQw4w9WgXcQ"
+    assert _clean_url(url) == url
